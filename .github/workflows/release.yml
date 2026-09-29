@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+# Serialize main pushes so each one gets the next patch tag.
+concurrency:
+  group: release
+
+jobs:
+  release:
+    name: Test and publish module release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Determine release tag
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "RELEASE_TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          else
+            latest=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+            latest=${latest:-v0.0.0}
+            IFS=. read -r major minor patch <<<"${latest#v}"
+            echo "RELEASE_TAG=v${major}.${minor}.$((patch + 1))" >> "$GITHUB_ENV"
+          fi
+
+      - name: Publish module release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists"
+          else
+            gh release create "$RELEASE_TAG" \
+              --target "$GITHUB_SHA" \
+              --generate-notes \
+              --title "vpsmonlib $RELEASE_TAG"
+          fi
