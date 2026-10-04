@@ -454,6 +454,24 @@ func getTopProcesses(sortByMem bool) []TopProcess {
 	return procs
 }
 
+// CollectProcessDetails reads process names and percentages on demand. It does
+// not collect command arguments, environment variables, logs, or containers.
+func CollectProcessDetails() (topCPU, topMem []TopProcess) {
+	return getTopProcesses(false), getTopProcesses(true)
+}
+
+func capacityMount(device, filesystem, options string) bool {
+	if !strings.HasPrefix(device, "/dev/") || filesystem == "squashfs" || filesystem == "iso9660" {
+		return false
+	}
+	for _, option := range strings.Split(options, ",") {
+		if option == "ro" {
+			return false
+		}
+	}
+	return true
+}
+
 func getCPUUsage() float64 {
 	read := func() (idle, total uint64) {
 		data, err := os.ReadFile("/proc/stat")
@@ -504,11 +522,11 @@ func getDiskInfo() []DiskInfo {
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
-		if len(fields) < 2 {
+		if len(fields) < 4 {
 			continue
 		}
 		device, mount := fields[0], fields[1]
-		if !strings.HasPrefix(device, "/dev/") {
+		if !capacityMount(device, fields[2], fields[3]) {
 			continue
 		}
 		if seen[device] {
