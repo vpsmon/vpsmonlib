@@ -13,7 +13,8 @@ func TestCapacityMountExcludesReadOnlyImages(t *testing.T) {
 		{"/dev/loop0", "squashfs", "ro,nodev", false},
 		{"/dev/loop0", "squashfs", "rw", false},
 		{"/dev/sr0", "iso9660", "ro", false},
-		{"/dev/vdc1", "ext4", "ro,relatime", false},
+		// ProtectSystem=strict makes the real root disk appear read-only.
+		{"/dev/vdc1", "ext4", "ro,relatime", true},
 		{"tmpfs", "tmpfs", "rw", false},
 	} {
 		if got := capacityMount(tt.device, tt.filesystem, tt.options); got != tt.want {

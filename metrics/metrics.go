@@ -460,14 +460,12 @@ func CollectProcessDetails() (topCPU, topMem []TopProcess) {
 	return getTopProcesses(false), getTopProcesses(true)
 }
 
-func capacityMount(device, filesystem, options string) bool {
+// A service sandbox can remount real host disks read-only in its namespace.
+// Mount permissions therefore do not tell us whether host capacity matters.
+// Exclude immutable application/media images by filesystem type instead.
+func capacityMount(device, filesystem, _ string) bool {
 	if !strings.HasPrefix(device, "/dev/") || filesystem == "squashfs" || filesystem == "iso9660" {
 		return false
-	}
-	for _, option := range strings.Split(options, ",") {
-		if option == "ro" {
-			return false
-		}
 	}
 	return true
 }
