@@ -2,9 +2,9 @@ package metrics
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -164,30 +164,32 @@ func collectMetrics(options Options) Metrics {
 		}
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), detailTimeout)
+	defer cancel()
+	var details sync.WaitGroup
 	if options.TopProcesses {
-		m.TopCPU = getTopProcesses(false)
-		m.TopMem = getTopProcesses(true)
+		details.Go(func() { m.TopCPU = getTopProcessesContext(ctx, false); m.TopMem = getTopProcessesContext(ctx, true) })
 	}
 	if options.Containers {
-		m.Containers = getDockerContainers()
+		details.Go(func() { m.Containers = getDockerContainersContext(ctx) })
 	}
 	if options.GPUs {
-		m.GPUs = getGPUs()
+		details.Go(func() { m.GPUs = getGPUsContext(ctx) })
 	}
 	if options.Listeners {
-		m.Listeners = getListeningSockets()
+		details.Go(func() { m.Listeners = getListeningSockets() })
 	}
+	details.Wait()
 
 	return m
 }
 
-func getGPUs() []GPUInfo {
-	return append(getNVIDIAGPUs(), getAMDGPUs()...)
+func getGPUsContext(ctx context.Context) []GPUInfo {
+	return append(getNVIDIAGPUsContext(ctx), getAMDGPUsContext(ctx)...)
 }
 
-func getNVIDIAGPUs() []GPUInfo {
-	cmd := exec.Command("nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits")
-	out, err := cmd.Output()
+func getNVIDIAGPUsContext(ctx context.Context) []GPUInfo {
+	out, err := commandOutput(ctx, false, "nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits")
 	if err != nil {
 		return nil
 	}
@@ -228,9 +230,8 @@ func getNVIDIAGPUs() []GPUInfo {
 	return gpus
 }
 
-func getAMDGPUs() []GPUInfo {
-	cmd := exec.Command("amd-smi", "monitor", "-tuv", "--csv")
-	out, err := cmd.Output()
+func getAMDGPUsContext(ctx context.Context) []GPUInfo {
+	out, err := commandOutput(ctx, false, "amd-smi", "monitor", "-tuv", "--csv")
 	if err != nil {
 		return nil
 	}
@@ -297,9 +298,8 @@ func parseAMDMetric(value string) (float64, bool) {
 	return metric, err == nil
 }
 
-func getDockerContainers() []DockerContainer {
-	cmd := exec.Command("docker", "ps", "-a", "--no-trunc", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}")
-	out, err := cmd.Output()
+func getDockerContainersContext(ctx context.Context) []DockerContainer {
+	out, err := commandOutput(ctx, false, "docker", "ps", "-a", "--no-trunc", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}")
 	if err != nil {
 		return nil
 	}
@@ -330,8 +330,8 @@ func getDockerContainers() []DockerContainer {
 		return nil
 	}
 
-	populateDockerStats(containersByID)
-	populateDockerDetails(containersByID)
+	populateDockerStatsContext(ctx, containersByID)
+	populateDockerDetailsContext(ctx, containersByID)
 
 	containers := make([]DockerContainer, 0, len(containersByID))
 	for _, container := range containersByID {
@@ -340,9 +340,8 @@ func getDockerContainers() []DockerContainer {
 	return containers
 }
 
-func populateDockerStats(containersByID map[string]*DockerContainer) {
-	cmd := exec.Command("docker", "stats", "--no-stream", "--no-trunc", "--format", "{{.ID}}\t{{.CPUPerc}}\t{{.MemPerc}}")
-	out, err := cmd.Output()
+func populateDockerStatsContext(ctx context.Context, containersByID map[string]*DockerContainer) {
+	out, err := commandOutput(ctx, false, "docker", "stats", "--no-stream", "--no-trunc", "--format", "{{.ID}}\t{{.CPUPerc}}\t{{.MemPerc}}")
 	if err != nil {
 		return
 	}
@@ -361,14 +360,14 @@ func populateDockerStats(containersByID map[string]*DockerContainer) {
 	}
 }
 
-func populateDockerDetails(containersByID map[string]*DockerContainer) {
+func populateDockerDetailsContext(ctx context.Context, containersByID map[string]*DockerContainer) {
 	ids := make([]string, 0, len(containersByID))
 	for id := range containersByID {
 		ids = append(ids, id)
 	}
 
 	args := append([]string{"inspect", "--format", "{{.Id}}\t{{.RestartCount}}\t{{.State.StartedAt}}\t{{with index .State \"Health\"}}{{.Status}}{{else}}none{{end}}"}, ids...)
-	out, err := exec.Command("docker", args...).Output()
+	out, err := commandOutput(ctx, false, "docker", args...)
 	if err != nil {
 		return
 	}
@@ -405,22 +404,21 @@ func GetContainerLogs(id string) (string, error) {
 		return "", fmt.Errorf("invalid container ID")
 	}
 
-	out, err := exec.Command("docker", "logs", "--tail", "100", "--timestamps", id).CombinedOutput()
+	out, err := commandOutput(context.Background(), true, "docker", "logs", "--tail", "100", "--timestamps", id)
 	if err != nil {
 		return "", fmt.Errorf("read container logs: %w", err)
 	}
 	return string(out), nil
 }
 
-func getTopProcesses(sortByMem bool) []TopProcess {
+func getTopProcessesContext(ctx context.Context, sortByMem bool) []TopProcess {
 	var procs []TopProcess
 	sortArg := "-%cpu"
 	if sortByMem {
 		sortArg = "-%mem"
 	}
 
-	cmd := exec.Command("ps", "-eo", "pcpu,pmem,comm", "--sort="+sortArg, "--no-headers")
-	out, err := cmd.Output()
+	out, err := commandOutput(ctx, false, "ps", "-eo", "pcpu,pmem,comm", "--sort="+sortArg, "--no-headers")
 	if err != nil {
 		return procs
 	}
@@ -457,7 +455,9 @@ func getTopProcesses(sortByMem bool) []TopProcess {
 // CollectProcessDetails reads process names and percentages on demand. It does
 // not collect command arguments, environment variables, logs, or containers.
 func CollectProcessDetails() (topCPU, topMem []TopProcess) {
-	return getTopProcesses(false), getTopProcesses(true)
+	ctx, cancel := context.WithTimeout(context.Background(), detailTimeout)
+	defer cancel()
+	return getTopProcessesContext(ctx, false), getTopProcessesContext(ctx, true)
 }
 
 // A service sandbox can remount real host disks read-only in its namespace.
