@@ -30,6 +30,14 @@ jobs:
       - name: Test
         run: go test ./...
 
+      - name: Cross-compile supported Linux architectures
+        env:
+          CGO_ENABLED: "0"
+          GOARM: "6"
+        run: |
+          for arch in amd64 arm64 arm 386; do
+            GOOS=linux GOARCH="$arch" go build ./...
+          done
       - name: Vet
         run: go vet ./...
 

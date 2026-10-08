@@ -15,7 +15,7 @@ func statfs(path string, buf *syscallStatfs) error {
 	if err := syscall.Statfs(path, &s); err != nil {
 		return err
 	}
-	buf.Bsize = s.Bsize
+	buf.Bsize = int64(s.Bsize)
 	buf.Blocks = s.Blocks
 	buf.Bavail = s.Bavail
 	return nil
