@@ -36,13 +36,16 @@ func commandOutput(parent context.Context, combined bool, name string, args ...s
 	defer cancel()
 	out := &limitedCommandBuffer{cancel: cancel}
 	cmd := exec.CommandContext(ctx, name, args...)
+	configureCommandProcess(cmd)
 	cmd.WaitDelay = 200 * time.Millisecond
 	cmd.Stdout = out
 	cmd.Stderr = io.Discard
 	if combined {
 		cmd.Stderr = out
 	}
-	if err := cmd.Run(); err != nil {
+	err := cmd.Run()
+	cleanupCommandProcess(cmd)
+	if err != nil {
 		return nil, errors.Join(err, out.err, ctx.Err())
 	}
 	return out.buffer.Bytes(), nil

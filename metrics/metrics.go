@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -464,10 +465,13 @@ func CollectProcessDetails() (topCPU, topMem []TopProcess) {
 // Mount permissions therefore do not tell us whether host capacity matters.
 // Exclude immutable application/media images by filesystem type instead.
 func capacityMount(device, filesystem, _ string) bool {
-	if !strings.HasPrefix(device, "/dev/") || filesystem == "squashfs" || filesystem == "iso9660" {
+	switch filesystem {
+	case "zfs":
+		return true
+	case "proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "cgroup", "cgroup2", "pstore", "securityfs", "debugfs", "tracefs", "configfs", "fusectl", "mqueue", "hugetlbfs", "rpc_pipefs", "autofs", "overlay", "squashfs", "iso9660", "nfs", "nfs4", "cifs", "smb3", "9p", "ceph", "glusterfs", "fuse.sshfs", "fuse.rclone", "fuse.s3fs":
 		return false
 	}
-	return true
+	return strings.HasPrefix(device, "/dev/")
 }
 
 func getCPUUsage() float64 {
@@ -508,51 +512,181 @@ func getCPUUsage() float64 {
 	return (1.0 - idleDelta/totalDelta) * 100
 }
 
+const diskProbeTimeout = 300 * time.Millisecond
+const diskProbeWorkers = 2
+const diskProbeQueue = 32
+const maxDiskProbes = 32
+
+type diskProbe struct {
+	index         int
+	mount, device string
+	ctx           context.Context
+	result        chan diskProbeResult
+}
+type diskProbeResult struct {
+	index int
+	info  DiskInfo
+	ok    bool
+}
+
+type diskProbePool struct {
+	jobs        chan diskProbe
+	probe       func(string, *syscallStatfs) error
+	workers     int
+	mu          sync.Mutex
+	outstanding map[string]struct{}
+	wg          sync.WaitGroup
+}
+
+func newDiskProbePool(workers, queueSize int, probe func(string, *syscallStatfs) error) *diskProbePool {
+	pool := &diskProbePool{jobs: make(chan diskProbe, queueSize), probe: probe, workers: workers, outstanding: make(map[string]struct{})}
+	for i := 0; i < workers; i++ {
+		pool.wg.Add(1)
+		go pool.worker()
+	}
+	return pool
+}
+
+func (pool *diskProbePool) enqueue(job diskProbe) bool {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if _, exists := pool.outstanding[job.mount]; exists || len(pool.outstanding) >= pool.workers+cap(pool.jobs) {
+		return false
+	}
+	pool.outstanding[job.mount] = struct{}{}
+	select {
+	case pool.jobs <- job:
+		return true
+	default:
+		delete(pool.outstanding, job.mount)
+		return false
+	}
+}
+
+func (pool *diskProbePool) finish(mount string) {
+	pool.mu.Lock()
+	delete(pool.outstanding, mount)
+	pool.mu.Unlock()
+}
+
+func (pool *diskProbePool) outstandingCount() int {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	return len(pool.outstanding)
+}
+
+func (pool *diskProbePool) close() {
+	close(pool.jobs)
+	pool.wg.Wait()
+}
+
+func (pool *diskProbePool) worker() {
+	defer pool.wg.Done()
+	for job := range pool.jobs {
+		if job.ctx.Err() != nil {
+			pool.finish(job.mount)
+			continue
+		}
+		var stat syscallStatfs
+		err := pool.probe(job.mount, &stat)
+		if err != nil || stat.Bsize <= 0 {
+			job.result <- diskProbeResult{index: job.index}
+			pool.finish(job.mount)
+			continue
+		}
+		total := stat.Blocks * uint64(stat.Bsize)
+		free := stat.Bavail * uint64(stat.Bsize)
+		used := uint64(0)
+		if free <= total {
+			used = total - free
+		}
+		pct := 0.0
+		if total > 0 {
+			pct = float64(used) / float64(total) * 100
+		}
+		job.result <- diskProbeResult{index: job.index, info: DiskInfo{Mount: job.mount, Device: job.device, Total: total, Used: used, Free: free, Percent: pct}, ok: true}
+		pool.finish(job.mount)
+	}
+}
+
+var globalDiskProbePool = newDiskProbePool(diskProbeWorkers, diskProbeQueue, statfs)
+
 func getDiskInfo() []DiskInfo {
-	var disks []DiskInfo
 	f, err := os.Open("/proc/mounts")
 	if err != nil {
-		return disks
+		return nil
 	}
 	defer f.Close()
+	return diskInfoFromMounts(f)
+}
 
+func diskInfoFromMounts(r io.Reader) []DiskInfo {
+	return diskInfoFromMountsWithPool(r, globalDiskProbePool)
+}
+
+func diskInfoFromMountsWithPool(r io.Reader, pool *diskProbePool) []DiskInfo {
+	var disks []DiskInfo
+	ctx, cancel := context.WithTimeout(context.Background(), diskProbeTimeout)
+	defer cancel()
+	results := make(chan diskProbeResult, maxDiskProbes)
+	type probeSlot struct {
+		mount     string
+		submitted bool
+	}
+	var slots []probeSlot
 	seen := map[string]bool{}
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) < 4 {
 			continue
 		}
-		device, mount := fields[0], fields[1]
+		device, mount := fields[0], decodeMountField(fields[1])
 		if !capacityMount(device, fields[2], fields[3]) {
 			continue
 		}
-		if seen[device] {
+		if seen[mount] || len(slots) >= maxDiskProbes {
 			continue
 		}
-		seen[device] = true
-
-		var stat syscallStatfs
-		if err := statfs(mount, &stat); err != nil {
-			continue
+		seen[mount] = true
+		index := len(slots)
+		slots = append(slots, probeSlot{mount: mount})
+		if pool.enqueue(diskProbe{index: index, mount: mount, device: filepath.Base(device), ctx: ctx, result: results}) {
+			slots[index].submitted = true
 		}
-		total := stat.Blocks * uint64(stat.Bsize)
-		free := stat.Bavail * uint64(stat.Bsize)
-		used := total - free
-		pct := 0.0
-		if total > 0 {
-			pct = float64(used) / float64(total) * 100
+	}
+	completed := make([]bool, len(slots))
+	resultsByIndex := make([]diskProbeResult, len(slots))
+	remaining := 0
+	for i := range slots {
+		if slots[i].submitted {
+			remaining++
 		}
-		disks = append(disks, DiskInfo{
-			Mount:   mount,
-			Device:  filepath.Base(device),
-			Total:   total,
-			Used:    used,
-			Free:    free,
-			Percent: pct,
-		})
+	}
+	for remaining > 0 {
+		select {
+		case result := <-results:
+			if result.index >= 0 && result.index < len(completed) && !completed[result.index] {
+				completed[result.index] = true
+				remaining--
+				if result.ok {
+					resultsByIndex[result.index] = result
+				}
+			}
+		case <-ctx.Done():
+			remaining = 0
+		}
+	}
+	for i, result := range resultsByIndex {
+		if i < len(slots) && result.ok {
+			disks = append(disks, result.info)
+		}
 	}
 	return disks
+}
+
+func decodeMountField(s string) string {
+	return strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`).Replace(s)
 }
 
 func getNetworkBytes() (rx, tx uint64) {
