@@ -12,6 +12,7 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go test ./...
+      - run: go test -race ./...
       - name: Cross-compile supported Linux architectures
         env:
           CGO_ENABLED: "0"

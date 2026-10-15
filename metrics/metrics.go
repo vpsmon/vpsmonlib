@@ -51,30 +51,31 @@ type GPUInfo struct {
 }
 
 type Metrics struct {
-	Hostname    string            `json:"hostname"`
-	Uptime      string            `json:"uptime"`
-	LoadAvg     string            `json:"load_avg"`
-	CPUCount    int               `json:"cpu_count"`
-	CPUUsage    float64           `json:"cpu_usage"`
-	MemTotal    uint64            `json:"mem_total"`
-	MemUsed     uint64            `json:"mem_used"`
-	MemFree     uint64            `json:"mem_free"`
-	MemPercent  float64           `json:"mem_percent"`
-	SwapTotal   uint64            `json:"swap_total"`
-	SwapUsed    uint64            `json:"swap_used"`
-	SwapPercent float64           `json:"swap_percent"`
-	Disks       []DiskInfo        `json:"disks"`
-	NetRx       uint64            `json:"net_rx"`
-	NetTx       uint64            `json:"net_tx"`
-	NetRxSpeed  float64           `json:"net_rx_speed"`
-	NetTxSpeed  float64           `json:"net_tx_speed"`
-	Processes   int               `json:"processes"`
-	TopCPU      []TopProcess      `json:"top_cpu"`
-	TopMem      []TopProcess      `json:"top_mem"`
-	Containers  []DockerContainer `json:"containers"`
-	GPUs        []GPUInfo         `json:"gpus"`
-	Listeners   []ListeningSocket `json:"listeners,omitempty"`
-	Timestamp   time.Time         `json:"timestamp"`
+	Hostname             string            `json:"hostname"`
+	Uptime               string            `json:"uptime"`
+	LoadAvg              string            `json:"load_avg"`
+	CPUCount             int               `json:"cpu_count"`
+	CPUUsage             float64           `json:"cpu_usage"`
+	MemTotal             uint64            `json:"mem_total"`
+	MemUsed              uint64            `json:"mem_used"`
+	MemFree              uint64            `json:"mem_free"`
+	MemPercent           float64           `json:"mem_percent"`
+	SwapTotal            uint64            `json:"swap_total"`
+	SwapUsed             uint64            `json:"swap_used"`
+	SwapPercent          float64           `json:"swap_percent"`
+	Disks                []DiskInfo        `json:"disks"`
+	DiskCollectionStatus string            `json:"disk_collection_status,omitempty"`
+	NetRx                uint64            `json:"net_rx"`
+	NetTx                uint64            `json:"net_tx"`
+	NetRxSpeed           float64           `json:"net_rx_speed"`
+	NetTxSpeed           float64           `json:"net_tx_speed"`
+	Processes            int               `json:"processes"`
+	TopCPU               []TopProcess      `json:"top_cpu"`
+	TopMem               []TopProcess      `json:"top_mem"`
+	Containers           []DockerContainer `json:"containers"`
+	GPUs                 []GPUInfo         `json:"gpus"`
+	Listeners            []ListeningSocket `json:"listeners,omitempty"`
+	Timestamp            time.Time         `json:"timestamp"`
 }
 
 type DiskInfo struct {
@@ -85,6 +86,12 @@ type DiskInfo struct {
 	Free    uint64  `json:"free"`
 	Percent float64 `json:"percent"`
 }
+
+const (
+	DiskCollectionComplete    = "complete"
+	DiskCollectionPartial     = "partial"
+	DiskCollectionUnavailable = "unavailable"
+)
 
 // Options controls optional details. Core host metrics are always collected.
 type Options struct {
@@ -149,7 +156,7 @@ func collectMetrics(options Options) Metrics {
 	}
 
 	// Disk usage from /proc/mounts + syscall
-	m.Disks = getDiskInfo()
+	m.Disks, m.DiskCollectionStatus = getDiskInfoWithStatus()
 
 	// Network from /proc/net/dev
 	m.NetRx, m.NetTx = getNetworkBytes()
@@ -513,9 +520,15 @@ func getCPUUsage() float64 {
 }
 
 const diskProbeTimeout = 300 * time.Millisecond
+const diskProbeWorkerWait = 100 * time.Millisecond
+
+// statfs may block in the kernel beyond context cancellation. Scheduler workers
+// therefore wait only until the collection deadline while the bounded probe
+// goroutine remains reserved until the syscall returns.
 const diskProbeWorkers = 2
 const diskProbeQueue = 32
 const maxDiskProbes = 32
+const maxOutstandingDiskProbes = 32
 
 type diskProbe struct {
 	index         int
@@ -532,14 +545,14 @@ type diskProbeResult struct {
 type diskProbePool struct {
 	jobs        chan diskProbe
 	probe       func(string, *syscallStatfs) error
-	workers     int
 	mu          sync.Mutex
 	outstanding map[string]struct{}
 	wg          sync.WaitGroup
+	probeWG     sync.WaitGroup
 }
 
 func newDiskProbePool(workers, queueSize int, probe func(string, *syscallStatfs) error) *diskProbePool {
-	pool := &diskProbePool{jobs: make(chan diskProbe, queueSize), probe: probe, workers: workers, outstanding: make(map[string]struct{})}
+	pool := &diskProbePool{jobs: make(chan diskProbe, queueSize), probe: probe, outstanding: make(map[string]struct{})}
 	for i := 0; i < workers; i++ {
 		pool.wg.Add(1)
 		go pool.worker()
@@ -550,7 +563,7 @@ func newDiskProbePool(workers, queueSize int, probe func(string, *syscallStatfs)
 func (pool *diskProbePool) enqueue(job diskProbe) bool {
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
-	if _, exists := pool.outstanding[job.mount]; exists || len(pool.outstanding) >= pool.workers+cap(pool.jobs) {
+	if _, exists := pool.outstanding[job.mount]; exists || len(pool.outstanding) >= maxOutstandingDiskProbes {
 		return false
 	}
 	pool.outstanding[job.mount] = struct{}{}
@@ -578,6 +591,7 @@ func (pool *diskProbePool) outstandingCount() int {
 func (pool *diskProbePool) close() {
 	close(pool.jobs)
 	pool.wg.Wait()
+	pool.probeWG.Wait()
 }
 
 func (pool *diskProbePool) worker() {
@@ -587,37 +601,66 @@ func (pool *diskProbePool) worker() {
 			pool.finish(job.mount)
 			continue
 		}
-		var stat syscallStatfs
-		err := pool.probe(job.mount, &stat)
-		if err != nil || stat.Bsize <= 0 {
-			job.result <- diskProbeResult{index: job.index}
+		done := make(chan struct{})
+		pool.probeWG.Add(1)
+		go func() {
+			defer pool.probeWG.Done()
+			result := pool.probeJob(job)
+			if job.ctx.Err() == nil {
+				// Deliver independently of the scheduler wait: a mount can take
+				// longer than the worker wait and still finish before collection
+				// times out. The result channel is buffered for every probe slot.
+				job.result <- result
+			}
+			// Release only after the actual syscall has returned. A timed-out
+			// caller cannot cause duplicate probes for this mount.
 			pool.finish(job.mount)
-			continue
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-job.ctx.Done():
+			// The probe continues in its bounded goroutine; this scheduler is
+			// immediately available for another mount.
+		case <-time.After(diskProbeWorkerWait):
+			// Free the scheduler before the collection deadline so queued
+			// healthy mounts still have time to return a fresh sample.
 		}
-		total := stat.Blocks * uint64(stat.Bsize)
-		free := stat.Bavail * uint64(stat.Bsize)
-		used := uint64(0)
-		if free <= total {
-			used = total - free
-		}
-		pct := 0.0
-		if total > 0 {
-			pct = float64(used) / float64(total) * 100
-		}
-		job.result <- diskProbeResult{index: job.index, info: DiskInfo{Mount: job.mount, Device: job.device, Total: total, Used: used, Free: free, Percent: pct}, ok: true}
-		pool.finish(job.mount)
 	}
+}
+
+func (pool *diskProbePool) probeJob(job diskProbe) diskProbeResult {
+	var stat syscallStatfs
+	if err := pool.probe(job.mount, &stat); err != nil || stat.Bsize <= 0 {
+		return diskProbeResult{index: job.index}
+	}
+	total := stat.Blocks * uint64(stat.Bsize)
+	free := stat.Bavail * uint64(stat.Bsize)
+	used := uint64(0)
+	if free <= total {
+		used = total - free
+	}
+	pct := 0.0
+	if total > 0 {
+		pct = float64(used) / float64(total) * 100
+	}
+	return diskProbeResult{index: job.index, info: DiskInfo{Mount: job.mount, Device: job.device, Total: total, Used: used, Free: free, Percent: pct}, ok: true}
 }
 
 var globalDiskProbePool = newDiskProbePool(diskProbeWorkers, diskProbeQueue, statfs)
 
 func getDiskInfo() []DiskInfo {
+	disks, _ := getDiskInfoWithStatus()
+	return disks
+}
+
+func getDiskInfoWithStatus() ([]DiskInfo, string) {
 	f, err := os.Open("/proc/mounts")
 	if err != nil {
-		return nil
+		return nil, DiskCollectionUnavailable
 	}
 	defer f.Close()
-	return diskInfoFromMounts(f)
+	return diskInfoFromMountsWithStatus(f, globalDiskProbePool)
 }
 
 func diskInfoFromMounts(r io.Reader) []DiskInfo {
@@ -625,6 +668,11 @@ func diskInfoFromMounts(r io.Reader) []DiskInfo {
 }
 
 func diskInfoFromMountsWithPool(r io.Reader, pool *diskProbePool) []DiskInfo {
+	disks, _ := diskInfoFromMountsWithStatus(r, pool)
+	return disks
+}
+
+func diskInfoFromMountsWithStatus(r io.Reader, pool *diskProbePool) ([]DiskInfo, string) {
 	var disks []DiskInfo
 	ctx, cancel := context.WithTimeout(context.Background(), diskProbeTimeout)
 	defer cancel()
@@ -634,18 +682,26 @@ func diskInfoFromMountsWithPool(r io.Reader, pool *diskProbePool) []DiskInfo {
 		submitted bool
 	}
 	var slots []probeSlot
+	eligible := 0
+	inputIncomplete := false
 	seen := map[string]bool{}
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) < 4 {
+			inputIncomplete = true
 			continue
 		}
 		device, mount := fields[0], decodeMountField(fields[1])
 		if !capacityMount(device, fields[2], fields[3]) {
 			continue
 		}
-		if seen[mount] || len(slots) >= maxDiskProbes {
+		if seen[mount] {
+			continue
+		}
+		eligible++
+		if len(slots) >= maxDiskProbes {
+			inputIncomplete = true
 			continue
 		}
 		seen[mount] = true
@@ -654,6 +710,9 @@ func diskInfoFromMountsWithPool(r io.Reader, pool *diskProbePool) []DiskInfo {
 		if pool.enqueue(diskProbe{index: index, mount: mount, device: filepath.Base(device), ctx: ctx, result: results}) {
 			slots[index].submitted = true
 		}
+	}
+	if scanner.Err() != nil {
+		inputIncomplete = true
 	}
 	completed := make([]bool, len(slots))
 	resultsByIndex := make([]diskProbeResult, len(slots))
@@ -682,7 +741,13 @@ func diskInfoFromMountsWithPool(r io.Reader, pool *diskProbePool) []DiskInfo {
 			disks = append(disks, result.info)
 		}
 	}
-	return disks
+	if len(disks) == 0 {
+		return disks, DiskCollectionUnavailable
+	}
+	if inputIncomplete || len(disks) < eligible {
+		return disks, DiskCollectionPartial
+	}
+	return disks, DiskCollectionComplete
 }
 
 func decodeMountField(s string) string {
