@@ -4,6 +4,10 @@ Shared Linux metric collection for [vpsmon](https://github.com/leodeim/vpsmon) a
 
 This module reads local system data. It has no HTTP client, Cloud endpoint, credentials, or telemetry uploader. `vpsmon` enables the detailed dashboard collection; `vpsagent` selects only the data needed for Cloud telemetry.
 
+Retained process, container and GPU names own their text rather than keeping
+whole command responses alive in history. Evicted history entries release their
+details. CPU totals count guest execution once, as part of Linux user/nice time.
+
 Disk usage probes use two scheduler workers and a fixed budget of 32 outstanding
 per-mount calls. Linux `statfs` calls blocked inside the kernel cannot be
 canceled; after 100 ms the scheduler moves on while the call retains its slot

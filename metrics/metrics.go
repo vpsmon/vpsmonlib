@@ -227,7 +227,7 @@ func getNVIDIAGPUsContext(ctx context.Context) []GPUInfo {
 		}
 
 		gpus = append(gpus, GPUInfo{
-			Name:        strings.TrimSpace(fields[0]),
+			Name:        strings.Clone(strings.TrimSpace(fields[0])),
 			Utilization: utilization,
 			MemoryUsed:  memoryUsed * 1024 * 1024,
 			MemoryTotal: memoryTotal * 1024 * 1024,
@@ -323,12 +323,13 @@ func getDockerContainersContext(ctx context.Context) []DockerContainer {
 		if len(parts) != 5 {
 			continue
 		}
-		containersByID[parts[0]] = &DockerContainer{
-			ID:     parts[0],
-			Name:   parts[1],
-			Image:  parts[2],
-			Status: parts[3],
-			Ports:  parts[4],
+		id := strings.Clone(parts[0])
+		containersByID[id] = &DockerContainer{
+			ID:     id,
+			Name:   strings.Clone(parts[1]),
+			Image:  strings.Clone(parts[2]),
+			Status: strings.Clone(parts[3]),
+			Ports:  strings.Clone(parts[4]),
 			Health: "none",
 			Uptime: "—",
 		}
@@ -390,7 +391,7 @@ func populateDockerDetailsContext(ctx context.Context, containersByID map[string
 			continue
 		}
 		container.RestartCount, _ = strconv.Atoi(parts[1])
-		container.Health = parts[3]
+		container.Health = strings.Clone(parts[3])
 		if startedAt, err := time.Parse(time.RFC3339Nano, parts[2]); err == nil && !startedAt.IsZero() && strings.HasPrefix(container.Status, "Up ") {
 			container.Uptime = formatUptime(time.Since(startedAt))
 		}
@@ -445,7 +446,9 @@ func getTopProcessesContext(ctx context.Context, sortByMem bool) []TopProcess {
 		mem, _ := strconv.ParseFloat(fields[1], 64)
 		name := strings.Join(fields[2:], " ")
 
-		name = filepath.Base(name)
+		// History keeps only five names; do not keep the entire ps response
+		// alive through a substring when a name contains a single word.
+		name = strings.Clone(filepath.Base(name))
 
 		procs = append(procs, TopProcess{
 			Name: name,
@@ -482,41 +485,56 @@ func capacityMount(device, filesystem, _ string) bool {
 }
 
 func getCPUUsage() float64 {
-	read := func() (idle, total uint64) {
+	read := func() (idle, total uint64, ok bool) {
 		data, err := os.ReadFile("/proc/stat")
 		if err != nil {
 			return
 		}
-		lines := strings.Split(string(data), "\n")
-		if len(lines) == 0 {
-			return
-		}
-		fields := strings.Fields(lines[0])
-		if len(fields) < 5 || fields[0] != "cpu" {
-			return
-		}
-		var vals []uint64
-		for _, f := range fields[1:] {
-			v, _ := strconv.ParseUint(f, 10, 64)
-			vals = append(vals, v)
-			total += v
-		}
-		if len(vals) >= 4 {
-			idle = vals[3]
-		}
-		return
+		return parseCPUStat(data)
 	}
 
-	idle1, total1 := read()
-	time.Sleep(500 * time.Millisecond)
-	idle2, total2 := read()
-
-	idleDelta := float64(idle2 - idle1)
-	totalDelta := float64(total2 - total1)
-	if totalDelta == 0 {
+	idle1, total1, ok := read()
+	if !ok {
 		return 0
 	}
-	return (1.0 - idleDelta/totalDelta) * 100
+	time.Sleep(500 * time.Millisecond)
+	idle2, total2, ok := read()
+	if !ok {
+		return 0
+	}
+	return cpuUsageBetween(idle1, total1, idle2, total2)
+}
+
+func parseCPUStat(data []byte) (idle, total uint64, ok bool) {
+	line, _, _ := strings.Cut(string(data), "\n")
+	fields := strings.Fields(line)
+	if len(fields) < 5 || fields[0] != "cpu" {
+		return 0, 0, false
+	}
+	// Linux already includes guest and guest_nice in user and nice. Sum only
+	// user, nice, system, idle, iowait, irq, softirq and steal.
+	for i, field := range fields[1:min(len(fields), 9)] {
+		value, err := strconv.ParseUint(field, 10, 64)
+		if err != nil || total+value < total {
+			return 0, 0, false
+		}
+		total += value
+		if i == 3 {
+			idle = value
+		}
+	}
+	return idle, total, true
+}
+
+func cpuUsageBetween(idle1, total1, idle2, total2 uint64) float64 {
+	if total2 <= total1 || idle2 < idle1 {
+		return 0
+	}
+	idleDelta, totalDelta := idle2-idle1, total2-total1
+	if idleDelta > totalDelta {
+		return 0
+	}
+	return (1.0 - float64(idleDelta)/float64(totalDelta)) * 100
 }
 
 const diskProbeTimeout = 300 * time.Millisecond
@@ -845,6 +863,7 @@ func collectAndStore(options Options) {
 
 	metricsHistory = append(metricsHistory, m)
 	if len(metricsHistory) > historySize {
+		metricsHistory[0] = Metrics{}
 		metricsHistory = metricsHistory[1:]
 	}
 }
