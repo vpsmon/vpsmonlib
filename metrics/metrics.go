@@ -23,10 +23,15 @@ var (
 	containerIDRE  = regexp.MustCompile(`^[a-fA-F0-9]{12,64}$`)
 )
 
+// TopProcess is a group of processes sharing a command name. CPU is the share
+// of whole-host CPU capacity used during a short measurement window; Mem is
+// the share of total RAM held resident. Count is the number of processes in
+// the group, omitted for a single process.
 type TopProcess struct {
-	Name string  `json:"name"`
-	CPU  float64 `json:"cpu"`
-	Mem  float64 `json:"mem"`
+	Name  string  `json:"name"`
+	CPU   float64 `json:"cpu"`
+	Mem   float64 `json:"mem"`
+	Count int     `json:"count,omitempty"`
 }
 
 type DockerContainer struct {
@@ -176,7 +181,7 @@ func collectMetrics(options Options) Metrics {
 	defer cancel()
 	var details sync.WaitGroup
 	if options.TopProcesses {
-		details.Go(func() { m.TopCPU = getTopProcessesContext(ctx, false); m.TopMem = getTopProcessesContext(ctx, true) })
+		details.Go(func() { m.TopCPU, m.TopMem = collectTopProcesses(ctx, m.MemTotal) })
 	}
 	if options.Containers {
 		details.Go(func() { m.Containers = getDockerContainersContext(ctx) })
@@ -420,55 +425,13 @@ func GetContainerLogs(id string) (string, error) {
 	return string(out), nil
 }
 
-func getTopProcessesContext(ctx context.Context, sortByMem bool) []TopProcess {
-	var procs []TopProcess
-	sortArg := "-%cpu"
-	if sortByMem {
-		sortArg = "-%mem"
-	}
-
-	out, err := commandOutput(ctx, false, "ps", "-eo", "pcpu,pmem,comm", "--sort="+sortArg, "--no-headers")
-	if err != nil {
-		return procs
-	}
-
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 3 {
-			continue
-		}
-		cpu, _ := strconv.ParseFloat(fields[0], 64)
-		mem, _ := strconv.ParseFloat(fields[1], 64)
-		name := strings.Join(fields[2:], " ")
-
-		// History keeps only five names; do not keep the entire ps response
-		// alive through a substring when a name contains a single word.
-		name = strings.Clone(filepath.Base(name))
-
-		procs = append(procs, TopProcess{
-			Name: name,
-			CPU:  cpu,
-			Mem:  mem,
-		})
-
-		if len(procs) >= 5 {
-			break
-		}
-	}
-	return procs
-}
-
 // CollectProcessDetails reads process names and percentages on demand. It does
 // not collect command arguments, environment variables, logs, or containers.
+// It takes about one second to measure current per-process CPU.
 func CollectProcessDetails() (topCPU, topMem []TopProcess) {
 	ctx, cancel := context.WithTimeout(context.Background(), detailTimeout)
 	defer cancel()
-	return getTopProcessesContext(ctx, false), getTopProcessesContext(ctx, true)
+	return collectTopProcesses(ctx, 0)
 }
 
 // A service sandbox can remount real host disks read-only in its namespace.

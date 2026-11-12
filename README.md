@@ -8,6 +8,12 @@ Retained process, container and GPU names own their text rather than keeping
 whole command responses alive in history. Evicted history entries release their
 details. CPU totals count guest execution once, as part of Linux user/nice time.
 
+Top processes are read from `/proc/<pid>/stat` twice, one second apart, rather
+than from `ps`, whose CPU column is a lifetime average. Processes are grouped
+by command name with a `count`. CPU is the group's share of whole-host
+capacity during that second (0-100, comparable with `cpu_usage`); memory is its
+resident share of total RAM, which counts shared pages in each process.
+
 Disk usage probes use two scheduler workers and a fixed budget of 32 outstanding
 per-mount calls. Linux `statfs` calls blocked inside the kernel cannot be
 canceled; after 100 ms the scheduler moves on while the call retains its slot
